@@ -10,6 +10,7 @@
 #ifndef CDC_INCO_BRINGUP_H_
 #define CDC_INCO_BRINGUP_H_
 
+#include "shipment.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,7 +25,7 @@
  * dashboard can show which unit runs which build and confirm a FOTA rollout.
  * BUMP THIS every time you build an image you intend to roll out.
  */
-#define APP_FW_VERSION "0.4.0"
+#define APP_FW_VERSION "0.1.0"
 
 /* TLS security tag used for the FOTA HTTPS download. By default it reuses the
  * broker's CA (BROKER_SEC_TAG = ISRG Root X1 / Let's Encrypt), which is correct
@@ -55,7 +56,7 @@ int bringup_imu_int_test(void);   /* DRDY on INT1 (P0.05): count edges/1 s   */
  * Any out pointer may be NULL. Returns 0 on success, negative on I2C error.
  */
 int bringup_imu_read_accel(float *gx, float *gy, float *gz);
-/* 50 Hz accel FIFO for the motion features (motion.c). */
+/* 100 Hz, +/-16 g accel FIFO for the shipment events (shipment.c). */
 int  bringup_imu_fifo_start(void);
 bool bringup_imu_fifo_on(void);
 int  bringup_imu_fifo_read(float *xyz, int max_frames); /* frames (x,y,z g) or <0 */
@@ -76,6 +77,8 @@ enum pt_chan {
 	PT_SUN  = 2, /* IC202 / T3 / AIN2 — AMBIENT_SUN (plate)  */
 	PT_COUNT = 3,
 };
+/* Versor: product temperature = T1/AIN0 (metal-coupled side, faces the goods). */
+#define PT_PROD PT_SKIN
 /* High-res ratiometric read of all three Pt1000 under ONE excitation pulse
  * (same method as bringup_temp_in_read). valid[i] is false for an open /
  * unfitted / out-of-band channel; temp_c[i] is then untouched.
@@ -140,7 +143,7 @@ int bringup_mqtt_pub(const char *payload); /* one-shot: provision+connect+publis
 /* ---- Persistent MQTT session (DK-style: connect once, publish periodically) */
 int  bringup_mqtt_session_start(void);            /* provision CA + attach + TLS connect + CONNACK */
 int  bringup_mqtt_session_publish(const char *payload); /* publish one QoS1 payload, pump for PUBACK */
-int  bringup_mqtt_session_publish_raw(const char *payload); /* same on projekt/raw/<id> */
+int  bringup_mqtt_session_publish_raw(const char *payload); /* same on versor/evt/<id> */
 int  bringup_mqtt_session_poll(int timeout_ms);   /* pump input/keepalive while idle */
 void bringup_mqtt_session_stop(void);             /* graceful MQTT disconnect         */
 
@@ -338,15 +341,14 @@ struct tel_rec {
 	int32_t ttff_s, fix_age_s;
 	/* IMU, mean over the window, m/s^2; act = mean |a - mean| (activity) */
 	float acc_x, acc_y, acc_z, act;
-	/* motion features (motion.c, 0.4.0); mot_ok false -> fields not sent */
-	bool mot_ok;
-	uint16_t sec[6];      /* graze, rum, walk, run, rest, other (s) */
-	uint16_t sec_lat, steps, pos_chg, still_max, gait_n;
-	float acc_peak, pitch, roll, pitch_sd;
-	float gait_f, gait_reg, gait_asym, gait_bob;
-	/* temperatures, C (NAN = invalid) */
-	float t_skin, t_amb, t_sun, t_bat, t_pmic;
-	float t_skin_min, t_skin_max, t_skin_sd;
+	/* Versor shipment window (shipment.c); shp.valid false -> not sent */
+	struct shp_win shp;
+	bool trip, trip_ok;   /* trip running / no violation so far        */
+	uint32_t trip_s;      /* trip duration s                           */
+	/* temperatures, C (NAN = invalid): t_in = product (PT_PROD), t_amb =
+	 * T2, t_aux = T3; window min/max of t_in are in shp.t_min/t_max.
+	 */
+	float t_in, t_amb, t_aux, t_bat, t_pmic;
 	/* power */
 	struct pmic_status pm;
 	/* cellular */
@@ -366,6 +368,12 @@ void telemetry_drop_oldest(void);
 int  telemetry_format(const struct tel_rec *r, char *buf, size_t n);
 /* JSON of the newest record (or a minimal one) for `bu pub` / NULL publish. */
 int  telemetry_format_latest(char *buf, size_t n);
+
+/* Versor glue (main.c, thread-safe): shipment thresholds from a cfg/cmd JSON
+ * (true if changed) and trip control 0 = stop, 1 = start, 2 = report.
+ */
+bool app_shipment_cfg(const char *json);
+void app_trip_cmd(int op);
 
 /* Main-thread reboot request (MQTT "reboot"/"id" commands). */
 void app_request_reboot(void);

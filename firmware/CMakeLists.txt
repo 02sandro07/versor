@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(cdc_inco_bringup)
+project(versor)
 
 target_sources(app PRIVATE
 	src/main.c
@@ -19,7 +19,7 @@ target_sources(app PRIVATE
 	src/devcfg.c
 	src/pmic.c
 	src/telemetry.c
-	src/motion.c
+	src/shipment.c
 )
 
 # FOTA (self-hosted HTTP(S) update via MCUboot dual-slot). Only compiled when

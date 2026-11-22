@@ -45,13 +45,18 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 
 /* ACC_CONF: acc_mode=normal(0x4)<<12 | acc_range=+/-4g(0x1)<<4 | acc_odr=100Hz(0x8) */
 #define ACC_CONF_NORMAL_4G_100HZ  0x4018
-/* same at 50 Hz (motion features, docs/PLAN-ERKENNUNG.md 1.1) */
-#define ACC_CONF_NORMAL_4G_50HZ   0x4017
+/* Versor shipment logging: normal, +/-16 g (0x3<<4), 100 Hz — shocks from
+ * drops reach 10+ g, +/-4 g would clip them.
+ */
+#define ACC_CONF_NORMAL_16G_100HZ 0x4038
 /* FIFO with accel frames only (x, y, z = 3 words); oldest overwritten when full */
 #define FIFO_CONF_ACC             0x0200
 #define FIFO_DUMMY_X              0x7F01  /* frame without new data */
-/* +/-4 g on 16-bit -> 8192 LSB/g */
-#define BMI323_LSB_PER_G          8192.0
+/* 16-bit: +/-4 g -> 8192 LSB/g, +/-16 g -> 2048 LSB/g */
+#define LSB_PER_G_4G              8192.0f
+#define LSB_PER_G_16G             2048.0f
+
+static float lsb_per_g = LSB_PER_G_4G; /* follows the range last written */
 
 static const struct device *const i2c = DEVICE_DT_GET(DT_NODELABEL(i2c2));
 static bool fifo_on;  /* FIFO configured (a soft reset, e.g. `bu imu`, clears it) */
@@ -197,6 +202,7 @@ int bringup_imu_init(void)
 		LOG_ERR("BMI323 ACC_CONF write failed: %d", err);
 		return err;
 	}
+	lsb_per_g = LSB_PER_G_4G;
 	k_msleep(10); /* let the accelerometer power up */
 
 	LOG_INF("BMI323 initialised: normal mode, +/-4 g, 100 Hz");
@@ -219,9 +225,9 @@ int bringup_imu_read(void)
 		raw[i] = (int16_t)d[i];
 	}
 
-	double gx = raw[0] / BMI323_LSB_PER_G;
-	double gy = raw[1] / BMI323_LSB_PER_G;
-	double gz = raw[2] / BMI323_LSB_PER_G;
+	double gx = raw[0] / (double)lsb_per_g;
+	double gy = raw[1] / (double)lsb_per_g;
+	double gz = raw[2] / (double)lsb_per_g;
 	double mag = sqrt(gx * gx + gy * gy + gz * gz);
 
 	LOG_INF("BMI323  x=%+.3f g  y=%+.3f g  z=%+.3f g  |a|=%.3f g "
@@ -245,18 +251,18 @@ int bringup_imu_read_accel(float *gx, float *gy, float *gz)
 		return err;
 	}
 	if (gx) {
-		*gx = (float)((int16_t)d[0]) / (float)BMI323_LSB_PER_G;
+		*gx = (float)((int16_t)d[0]) / lsb_per_g;
 	}
 	if (gy) {
-		*gy = (float)((int16_t)d[1]) / (float)BMI323_LSB_PER_G;
+		*gy = (float)((int16_t)d[1]) / lsb_per_g;
 	}
 	if (gz) {
-		*gz = (float)((int16_t)d[2]) / (float)BMI323_LSB_PER_G;
+		*gz = (float)((int16_t)d[2]) / lsb_per_g;
 	}
 	return 0;
 }
 
-/* --- FIFO at 50 Hz (motion sampling) ----------------------------------- */
+/* --- FIFO at 100 Hz, +/-16 g (shipment events, shipment.c) ------------- */
 
 int bringup_imu_fifo_start(void)
 {
@@ -266,7 +272,8 @@ int bringup_imu_fifo_start(void)
 	if (bringup_imu_init() != 0) {
 		return -EIO;
 	}
-	err = bmi_write(REG_ACC_CONF, ACC_CONF_NORMAL_4G_50HZ);
+	err = bmi_write(REG_ACC_CONF, ACC_CONF_NORMAL_16G_100HZ);
+	lsb_per_g = LSB_PER_G_16G;
 	err |= bmi_write(REG_FIFO_CONF, FIFO_CONF_ACC);
 	err |= bmi_write(REG_FIFO_CTRL, 0x0001);
 	if (err) {
@@ -275,7 +282,7 @@ int bringup_imu_fifo_start(void)
 	}
 	k_msleep(10);
 	fifo_on = true;
-	LOG_INF("BMI323 FIFO: accel 50 Hz, +/-4 g");
+	LOG_INF("BMI323 FIFO: accel 100 Hz, +/-16 g");
 	return 0;
 }
 
@@ -285,9 +292,9 @@ bool bringup_imu_fifo_on(void)
 }
 
 /* Read up to max frames (x, y, z in g) from the FIFO. Returns frames or <0.
- * The FIFO holds 1024 words = 341 frames = 6.8 s at 50 Hz; the caller reads
- * every 100 ms, so it only fills during a long LTE attach (then the oldest
- * samples are overwritten, the motion filters just see a gap).
+ * The FIFO holds 1024 words = 341 frames = 3.4 s at 100 Hz; the caller reads
+ * every 100 ms, so it only fills while the main loop sends (LTE attach, TLS):
+ * then the oldest samples are overwritten and a shock in that gap is missed.
  */
 int bringup_imu_fifo_read(float *xyz, int max)
 {
@@ -327,7 +334,7 @@ int bringup_imu_fifo_read(float *xyz, int max)
 			for (int k = 0; k < 3; k++) {
 				int16_t v = (int16_t)(f[2 * k] | (f[2 * k + 1] << 8));
 
-				xyz[3 * got + k] = (float)v / (float)BMI323_LSB_PER_G;
+				xyz[3 * got + k] = (float)v / lsb_per_g;
 			}
 			got++;
 		}

@@ -23,7 +23,6 @@
 #include <string.h>
 
 #include "bringup.h"
-#include "motion.h"
 #if defined(CONFIG_DATE_TIME)
 #include <date_time.h>
 #endif
@@ -36,10 +35,10 @@ LOG_MODULE_REGISTER(mqtt, LOG_LEVEL_INF);
 
 /* Topics are built from the device ID (serial number, e.g. P0.1.1 — see
  * devcfg.c; same ID in the dashboard and in the Cockpit inventory):
- *   projekt/data/<id>  uplink: telemetry + status/FOTA lines
- *   projekt/cmd/<id>   downlink commands, e.g. {"cmd":"fota","url":"..."}
- *   projekt/raw/<id>   uplink: raw accel bursts (test only, see motion.h)
- *   projekt/cfg/<id>   downlink config, RETAINED by the backend, e.g.
+ *   versor/data/<id>  uplink: telemetry + status/FOTA lines
+ *   versor/evt/<id>   uplink: trip reports (start/stop/report)
+ *   versor/cmd/<id>   downlink commands, e.g. {"cmd":"trip","a":"start"}
+ *   versor/cfg/<id>   downlink config, RETAINED by the backend, e.g.
  *                      {"mode":"normal","int":300,"gnss":300,"led":0} — the
  *                      broker hands it over on every subscribe, so a device in
  *                      "normal" (PSM) mode picks up changes at its next cycle.
@@ -113,8 +112,8 @@ volatile struct pub_diag g_pub;
  *                                                      on = green
  *   {"cmd":"id","id":"P0.1.2"}                         set serial + reboot
  *   {"cmd":"reboot"}
- *   {"cmd":"raw","s":60}                               record s seconds of raw
- *                                                      accel, sent on the raw topic
+ *   {"cmd":"trip","a":"start|stop|get"}                shipment trip; a report
+ *                                                      follows on versor/evt/<id>
  */
 static void handle_command(const char *payload)
 {
@@ -136,7 +135,7 @@ static void handle_command(const char *payload)
 		IF_ENABLED(CONFIG_FOTA_DOWNLOAD, ((void)bringup_fota_start_url(url);));
 	} else if (strcmp(cmd, "cfg") == 0) {
 		(void)devcfg_apply_json(payload);
-		(void)motion_apply_json(payload);
+		(void)app_shipment_cfg(payload);
 	} else if (strcmp(cmd, "led") == 0) {
 		int32_t on, c;
 		char j[16];
@@ -158,15 +157,11 @@ static void handle_command(const char *payload)
 		}
 	} else if (strcmp(cmd, "reboot") == 0) {
 		app_request_reboot();
-	} else if (strcmp(cmd, "raw") == 0) {
-		int32_t sec = 60;
-		int64_t now = 0;
+	} else if (strcmp(cmd, "trip") == 0) {
+		char a[8] = "get";
 
-		(void)json_get_int(payload, "s", &sec);
-		motion_raw_start((int)sec);
-		IF_ENABLED(CONFIG_DATE_TIME, (if (date_time_now(&now) != 0) { now = 0; }));
-		motion_raw_set_start(now / 1000);
-		LOG_INF("Raw burst: recording %d s", (int)sec);
+		(void)json_get_str(payload, "a", a, sizeof(a));
+		app_trip_cmd(!strcmp(a, "start") ? 1 : !strcmp(a, "stop") ? 0 : 2);
 	} else {
 		LOG_WRN("Unknown command \"%s\" (ignored)", cmd);
 	}
@@ -231,9 +226,7 @@ static void mqtt_evt_handler(struct mqtt_client *c, const struct mqtt_evt *evt)
 			    memcmp(p->message.topic.topic.utf8, cfg_topic,
 				   strlen(cfg_topic)) == 0) {
 				(void)devcfg_apply_json((const char *)cmd_buf);
-				if (motion_apply_json((const char *)cmd_buf)) {
-					LOG_INF("Motion thresholds updated");
-				}
+				(void)app_shipment_cfg((const char *)cmd_buf);
 			} else {
 				handle_command((const char *)cmd_buf);
 			}
@@ -282,7 +275,7 @@ static void client_init(void)
 	mqtt_client_init(&client);
 	client_inited = true;
 
-	snprintk(client_id, sizeof(client_id), "%s-r1a-%08x",
+	snprintk(client_id, sizeof(client_id), "%s-vsr-%08x",
 		 devcfg_device_id(), sys_rand32_get());
 
 	client.broker = &broker;
@@ -470,10 +463,10 @@ int bringup_mqtt_session_start(void)
 		return err;
 	}
 
-	snprintk(pub_topic, sizeof(pub_topic), "projekt/data/%s", devcfg_device_id());
-	snprintk(raw_topic, sizeof(raw_topic), "projekt/raw/%s", devcfg_device_id());
-	snprintk(cmd_topic, sizeof(cmd_topic), "projekt/cmd/%s", devcfg_device_id());
-	snprintk(cfg_topic, sizeof(cfg_topic), "projekt/cfg/%s", devcfg_device_id());
+	snprintk(pub_topic, sizeof(pub_topic), "versor/data/%s", devcfg_device_id());
+	snprintk(raw_topic, sizeof(raw_topic), "versor/evt/%s", devcfg_device_id());
+	snprintk(cmd_topic, sizeof(cmd_topic), "versor/cmd/%s", devcfg_device_id());
+	snprintk(cfg_topic, sizeof(cfg_topic), "versor/cfg/%s", devcfg_device_id());
 
 	client_init();
 

@@ -19,17 +19,17 @@
  *   boot, rst, bl (backlog incl. this one)
  *   lat, lon, sat, fix, hacc, speed, cn0, ttff, fix_age
  *   acc_x, acc_y, acc_z (mean, m/s^2), act (mean |a - mean|, m/s^2)
- *   t_skin, t_amb, t_sun, t_bat, t_pmic (C)
+ *   t_in (product, T1), t_amb (T2), t_aux (T3), t_bat, t_pmic (C)
  *   vbat (V), ibat (mA, + charging), soc (%), chg (0 no / 1 charging / 2 full),
  *   chg_st (raw status), chg_err, vbus, chg_red (warm-reduced current)
  *   rsrp (dBm), rsrq (dB), snr (dB), cell, tac, band, plmn
  *   led (bit0 red, bit1 green, bit2 blue)
- * From 0.4.0 (motion.c, docs/PLAN-ERKENNUNG.md 1.5), only when the 50 Hz FIFO ran:
- *   min_graze, min_rum, min_walk, min_run, min_rest, min_other, min_lat
- *   (SECONDS per class in the window, the name is historic), steps, pos_chg,
- *   still_max (s), acc_peak (m/s^2), pitch, roll, pitch_sd (deg),
- *   gait_n, gait_f (Hz), gait_reg, gait_asym, gait_bob (m/s^2)
- *   t_skin_min, t_skin_max, t_skin_sd (C)
+ * Versor (shipment.c), shipment fields only when the 100 Hz FIFO ran:
+ *   shk, shk_max (g), fall, fall_ms, tilt (deg now), tilt_max, orient
+ *   (0 upright, 1 tilted, 2 upside down), ev [{"t":unix s|0,"u":uptime s,
+ *   "e":"shock|fall|tilt|flip|t_hi|t_lo|t_ok","v":value}], ev_lost
+ *   t_in_min, t_in_max, t_out_s (s outside [t_lo,t_hi]), t_st (-1/0/1)
+ *   trip (0/1), trip_s, trip_ok (0/1)
  */
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -175,33 +175,35 @@ int telemetry_format(const struct tel_rec *r, char *buf, size_t n)
 	jb_add(&b, ",\"acc_x\":%.2f,\"acc_y\":%.2f,\"acc_z\":%.2f,\"act\":%.3f",
 	       (double)r->acc_x, (double)r->acc_y, (double)r->acc_z, (double)r->act);
 
-	/* Temperatures */
-	if (r->mot_ok) {
-		static const char *const k[6] = { "min_graze", "min_rum", "min_walk",
-						  "min_run", "min_rest", "min_other" };
+	/* Shipment */
+	const struct shp_win *w = &r->shp;
 
-		for (int i = 0; i < 6; i++) {
-			jb_add(&b, ",\"%s\":%u", k[i], r->sec[i]);
+	if (w->valid) {
+		jb_add(&b, ",\"shk\":%u", w->shocks);
+		jb_float(&b, "shk_max", w->shock_max, 1, w->shocks > 0);
+		jb_add(&b, ",\"fall\":%u,\"fall_ms\":%u", w->falls, w->fall_max_ms);
+		jb_float(&b, "tilt", w->tilt, 0, !isnan(w->tilt));
+		jb_float(&b, "tilt_max", w->tilt_max, 0, !isnan(w->tilt_max));
+		jb_add(&b, ",\"orient\":%u,\"ev\":[", w->orient);
+		for (int i = 0; i < w->n_evt; i++) {
+			const struct shp_evt *e = &w->evt[i];
+
+			jb_add(&b, "%s{\"t\":%lld,\"u\":%u,\"e\":\"%s\",\"v\":%.1f}",
+			       i ? "," : "", (long long)e->ts, e->up_s,
+			       shipment_evt_name(e->type), (double)e->val);
 		}
-		jb_add(&b, ",\"min_lat\":%u,\"steps\":%u,\"pos_chg\":%u,\"still_max\":%u",
-		       r->sec_lat, r->steps, r->pos_chg, r->still_max);
-		jb_float(&b, "acc_peak", r->acc_peak, 2, true);
-		jb_float(&b, "pitch", r->pitch, 1, true);
-		jb_float(&b, "roll", r->roll, 1, true);
-		jb_float(&b, "pitch_sd", r->pitch_sd, 1, true);
-		jb_add(&b, ",\"gait_n\":%u", r->gait_n);
-		jb_float(&b, "gait_f", r->gait_f, 2, r->gait_n > 0);
-		jb_float(&b, "gait_reg", r->gait_reg, 2, r->gait_n > 0);
-		jb_float(&b, "gait_asym", r->gait_asym, 2, r->gait_n > 0);
-		jb_float(&b, "gait_bob", r->gait_bob, 2, r->gait_n > 0);
+		jb_add(&b, "],\"ev_lost\":%u", w->evt_lost);
 	}
+	jb_add(&b, ",\"trip\":%d,\"trip_s\":%u,\"trip_ok\":%d", r->trip ? 1 : 0,
+	       r->trip_s, r->trip_ok ? 1 : 0);
 
-	jb_float(&b, "t_skin", r->t_skin, 2, true);
-	jb_float(&b, "t_skin_min", r->t_skin_min, 2, true);
-	jb_float(&b, "t_skin_max", r->t_skin_max, 2, true);
-	jb_float(&b, "t_skin_sd", r->t_skin_sd, 3, true);
+	/* Temperatures */
+	jb_float(&b, "t_in", r->t_in, 2, true);
+	jb_float(&b, "t_in_min", w->t_min, 2, !isnan(w->t_min));
+	jb_float(&b, "t_in_max", w->t_max, 2, !isnan(w->t_max));
+	jb_add(&b, ",\"t_out_s\":%u,\"t_st\":%d", w->t_out_s, w->t_state);
 	jb_float(&b, "t_amb", r->t_amb, 2, true);
-	jb_float(&b, "t_sun", r->t_sun, 2, true);
+	jb_float(&b, "t_aux", r->t_aux, 2, true);
 	jb_float(&b, "t_bat", r->t_bat, 1, pm->present);
 	jb_float(&b, "t_pmic", r->t_pmic, 1, pm->present);
 

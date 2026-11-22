@@ -2,26 +2,28 @@
  * Copyright (c) 2026 Cadenced
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  *
- * CDC-INCO-Prototyp-R1A (CU board + Power board) test firmware.
+ * Versor shipment logger on the Pecura hardware (R1A: nRF9151, BMI323,
+ * 3x Pt1000, nPM1300) — based on the Pecura test firmware 0.4.0.
  *
- * Implements "Testplan R1A, Kap. 3 — Voraussetzung: Testfirmware": every field
- * the test protocol needs is measured on the device itself and sent to the NAS
- * (see telemetry.c for the JSON), with three operating modes (devcfg.c):
+ * The BMI323 runs at 100 Hz / +-16 g into its FIFO; shipment.c turns the
+ * samples into shock, fall, tilt and flip events, the product temperature
+ * (T1/AIN0) into t_hi/t_lo/t_ok events, and sums everything per trip
+ * (`bu trip start|stop|show`, or {"cmd":"trip","a":"start"}). The trip summary
+ * is kept in flash (settings "vsr/trip") and survives resets.
  *
+ * Modes (devcfg.c):
  *   normal  energy saving: sample for interval_s (default 300 s), then connect,
- *           send the record (+ any backlog), listen ~4 s for commands/config,
- *           disconnect and let LTE fall into PSM until the next cycle. Commands
- *           reach the device with at most one interval of delay.
- *   live    always-on MQTT, 30 s — commands arrive instantly (bench tests).
- *   drain   empty the battery fast (D-4): always-on MQTT, 10 s, GNSS
- *           continuous, all LEDs on. Runs until the battery is flat.
+ *           send the record (+ backlog), listen ~4 s for commands/config,
+ *           disconnect (PSM). An event (shock, fall, flip, temperature limit)
+ *           closes the window early (at most once per ALARM_MIN_WINDOW_MS).
+ *   live    always-on MQTT, 30 s.
+ *   drain   empty the battery fast: always-on MQTT, 10 s, GNSS continuous.
  *
- * The mode, interval, GNSS interval and LED come from the backend as a retained
- * config message (projekt/cfg/<id>) or from the RTT shell (`bu mode drain`).
+ * Topics: versor/data|evt|cmd|cfg/<id> (mqtt.c). Thresholds are cfg keys
+ * (shock_mg, fall_ms, tilt, t_lim, t_lo, t_hi, alarm — shipment.h).
  *
  * A hardware watchdog resets a hung firmware (reported as rst:"wdt"); a new
- * FOTA image that hangs before its first successful publish is therefore also
- * rolled back by MCUboot.
+ * FOTA image that hangs before its first successful publish is rolled back.
  *
  * Everything else stays available on the `bu` RTT shell (see bottom).
  */
@@ -39,17 +41,24 @@
 #endif
 
 #include "bringup.h"
-#include "motion.h"
+#include "shipment.h"
+#include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* Fast-loop slice: accel FIFO drain + MQTT poll (or sleep) per slice. The
- * BMI323 samples at 50 Hz into its FIFO; each slice reads the ~5 new frames
- * and feeds motion.c (behaviour, steps, gait). Without FIFO (old chip config,
- * I2C error) one sample per slice still gives the window mean and "act".
+ * BMI323 samples at 100 Hz into its FIFO (~10 frames per slice, room for
+ * ~3.4 s); each slice feeds shipment.c. Without FIFO one sample per slice
+ * still gives the window mean and "act", but no events.
  */
 #define SAMPLE_SLICE_MS 100
-#define FIFO_FRAMES_MAX 64
+#define FIFO_FRAMES_MAX 128
+
+/* An event closes the window early, but not before this (bounds airtime). */
+#define ALARM_MIN_WINDOW_MS (60 * 1000)
+
+/* Store the running trip at least this often (counts, duration). */
+#define TRIP_SAVE_MS (10 * 60 * 1000)
 
 /* Pt1000 read period. Each read pulses the excitation for ~45 ms (3 nodes + top,
  * 256x oversampled), so 500 ms = ~9 % duty (no measurable self-heating) and
@@ -106,6 +115,138 @@ static atomic_t reboot_req;
 void app_request_reboot(void)
 {
 	atomic_set(&reboot_req, 1);
+}
+
+/* ------------------------------ shipment glue ---------------------------- */
+
+/* shipment.c is plain C: one lock for the main loop, MQTT handler, shell. */
+static K_MUTEX_DEFINE(shp_lock);
+#define SHP_LOCK()   k_mutex_lock(&shp_lock, K_FOREVER)
+#define SHP_UNLOCK() k_mutex_unlock(&shp_lock)
+
+static atomic_t trip_req;      /* bit0 start, bit1 stop, bit2 report */
+static atomic_t trip_report;   /* send a trip report on the evt topic */
+static struct shp_trip trip_stored;
+static bool trip_loaded;
+static int64_t trip_saved_ms;
+
+static int64_t unix_now_s(void)
+{
+#if defined(CONFIG_DATE_TIME)
+	int64_t ms;
+
+	if (date_time_now(&ms) == 0) {
+		return ms / 1000;
+	}
+#endif
+	return 0;
+}
+
+static int vsr_set(const char *name, size_t len, settings_read_cb read_cb,
+		   void *cb_arg)
+{
+	const char *next;
+
+	if (settings_name_steq(name, "trip", &next) && !next &&
+	    len == sizeof(trip_stored)) {
+		if (read_cb(cb_arg, &trip_stored, sizeof(trip_stored)) ==
+		    sizeof(trip_stored)) {
+			trip_loaded = true;
+		}
+	}
+	return 0;
+}
+SETTINGS_STATIC_HANDLER_DEFINE(vsr, "vsr", NULL, vsr_set, NULL, NULL);
+
+/* Write the trip to flash if it changed (or periodically while it runs). */
+static void trip_persist(bool force)
+{
+	struct shp_trip t;
+
+	SHP_LOCK();
+	bool dirty = shipment_trip_dirty();
+
+	shipment_trip_get(&t);
+	SHP_UNLOCK();
+	if (!force && !dirty &&
+	    !(t.active && k_uptime_get() - trip_saved_ms >= TRIP_SAVE_MS)) {
+		return;
+	}
+	int err = settings_save_one("vsr/trip", &t, sizeof(t));
+
+	trip_saved_ms = k_uptime_get();
+	if (err) {
+		LOG_WRN("Trip not stored (%d)", err);
+	}
+}
+
+bool app_shipment_cfg(const char *json)
+{
+	SHP_LOCK();
+	bool changed = shipment_apply_json(json);
+	SHP_UNLOCK();
+
+	if (changed) {
+		struct shp_params p;
+
+		shipment_get_params(&p);
+		LOG_INF("Shipment cfg: shock %d mg, fall %d ms, tilt %d deg, "
+			"t_lim %d [%d..%d C], alarm %d", p.shock_mg, p.fall_ms,
+			p.tilt_deg, p.t_lim, p.t_lo, p.t_hi, p.alarm);
+	}
+	return changed;
+}
+
+/* Callable from any thread; carried out by the main loop (flash, MQTT). */
+void app_trip_cmd(int op)
+{
+	atomic_or(&trip_req, op == 1 ? 1 : op == 0 ? 2 : 4);
+}
+
+static void trip_requests(void)
+{
+	atomic_val_t r = atomic_set(&trip_req, 0);
+
+	if (!r) {
+		return;
+	}
+	SHP_LOCK();
+	if (r & 2) {
+		shipment_trip_stop();
+	}
+	if (r & 1) {
+		shipment_trip_start();
+	}
+	SHP_UNLOCK();
+	if (r & 3) {
+		LOG_INF("Trip %s", (r & 1) ? "started" : "stopped");
+		trip_persist(true);
+	}
+	atomic_set(&trip_report, 1);
+}
+
+static int trip_format(char *buf, size_t n)
+{
+	struct shp_trip t;
+
+	SHP_LOCK();
+	shipment_trip_get(&t);
+	SHP_UNLOCK();
+	return snprintk(buf, n,
+		"{\"device_id\":\"%s\",\"trip\":\"%s\",\"ok\":%s,"
+		"\"start\":%lld,\"stop\":%lld,\"dur_s\":%u,"
+		"\"shk\":%u,\"shk_max\":%.1f,\"fall\":%u,\"fall_ms\":%u,"
+		"\"tilt\":%u,\"flip\":%u,\"tilt_max\":%.0f,"
+		"\"t_viol\":%u,\"t_out_s\":%u,\"t_min\":%.2f,\"t_max\":%.2f,"
+		"\"resets\":%u}",
+		devcfg_device_id(), t.active ? "running" : (t.start_up || t.start_ts ? "stopped" : "none"),
+		shipment_trip_ok(&t) ? "true" : "false",
+		(long long)t.start_ts, (long long)t.stop_ts, t.dur_s,
+		t.shocks, (double)t.shock_max, t.falls, t.fall_max_ms,
+		t.tilts, t.flips, isnan(t.tilt_max) ? -1.0 : (double)t.tilt_max,
+		t.t_viol, t.t_out_s,
+		isnan(t.t_min) ? -999.0 : (double)t.t_min,
+		isnan(t.t_max) ? -999.0 : (double)t.t_max, t.resets);
 }
 
 /* ------------------------------ watchdog --------------------------------- */
@@ -317,34 +458,18 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 	uint32_t gen0 = devcfg_generation();
 	int temp_period = cfg->mode == APP_MODE_NORMAL ? TEMP_PERIOD_SLOW_MS :
 							  TEMP_PERIOD_FAST_MS;
-	int64_t t_end = k_uptime_get() + (int64_t)cfg->interval_s * 1000;
-	int64_t next_temp = k_uptime_get();
-	int64_t next_pmic = k_uptime_get();
-
-	/* skin temperature spread (Welford over the single reads) */
-	double sk_mean = 0, sk_m2 = 0;
-	float sk_min = NAN, sk_max = NAN;
+	int64_t t0 = k_uptime_get();
+	int64_t t_end = t0 + (int64_t)cfg->interval_s * 1000;
+	int64_t next_temp = t0;
+	int64_t next_pmic = t0;
+	int64_t last_temp = 0;
 	static float fifo[FIFO_FRAMES_MAX * 3];
-	static int64_t last_raw_ms;
 
 	LOCK();
 	if (!bringup_imu_fifo_on()) {
 		(void)bringup_imu_fifo_start();
 	}
 	UNLOCK();
-	/* Periodic raw burst ("raw_every" min, test phase only). */
-	struct motion_params mp;
-
-	motion_get_params(&mp);
-	if (mp.raw_every_min > 0 && !motion_raw_recording() && !motion_raw_ready() &&
-	    (last_raw_ms == 0 || k_uptime_get() - last_raw_ms >= mp.raw_every_min * 60000LL)) {
-		int64_t now = 0;
-
-		last_raw_ms = k_uptime_get();
-		motion_raw_start(MOTION_RAW_MAX_S);
-		IF_ENABLED(CONFIG_DATE_TIME, (if (date_time_now(&now) != 0) { now = 0; }));
-		motion_raw_set_start(now / 1000);
-	}
 
 	while (k_uptime_get() < t_end) {
 		wdt_kick();
@@ -359,6 +484,9 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 		}
 		bool fed = bringup_imu_fifo_on();
 		UNLOCK();
+
+		SHP_LOCK();
+		shipment_clock(unix_now_s(), (uint32_t)(k_uptime_get() / 1000));
 		for (int f = 0; f < nf; f++) {
 			float gx = fifo[3 * f], gy = fifo[3 * f + 1], gz = fifo[3 * f + 2];
 			double mag = sqrt((double)(gx * gx + gy * gy + gz * gz));
@@ -370,14 +498,17 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 			sz += (double)gz;
 			m_mean += d / n_acc;
 			m_m2 += d * (mag - m_mean);
+			/* Events need the steady 100 Hz FIFO stream, not single reads. */
 			if (fed) {
-				motion_sample(gx, gy, gz);
+				shipment_sample(gx, gy, gz);
 			}
 		}
+		SHP_UNLOCK();
 
 		if (k_uptime_get() >= next_temp) {
 			double tc[PT_COUNT];
 			bool ok[PT_COUNT];
+			int64_t now = k_uptime_get();
 
 			LOCK();
 			bringup_temp_read_all(tc, ok);
@@ -388,15 +519,11 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 					nt[i]++;
 				}
 			}
-			if (ok[PT_SKIN]) {
-				float v = (float)tc[PT_SKIN];
-				double d = tc[PT_SKIN] - sk_mean;
-
-				sk_mean += d / nt[PT_SKIN];
-				sk_m2 += d * (tc[PT_SKIN] - sk_mean);
-				sk_min = isnan(sk_min) || v < sk_min ? v : sk_min;
-				sk_max = isnan(sk_max) || v > sk_max ? v : sk_max;
-			}
+			SHP_LOCK();
+			shipment_temp(ok[PT_PROD] ? (float)tc[PT_PROD] : NAN,
+				      last_temp ? (uint32_t)(now - last_temp) : 0);
+			SHP_UNLOCK();
+			last_temp = now;
 			next_temp += temp_period;
 		}
 
@@ -411,8 +538,20 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 			k_msleep(SAMPLE_SLICE_MS);
 		}
 
+		trip_requests();
+
 		if (devcfg_generation() != gen0 || atomic_get(&reboot_req)) {
 			LOG_INF("Config changed — closing the window early");
+			break;
+		}
+		/* Shock / fall / flip / temperature limit: send now instead of at
+		 * the end of the interval (at most once per ALARM_MIN_WINDOW_MS).
+		 */
+		SHP_LOCK();
+		bool alarm = shipment_alarm();
+		SHP_UNLOCK();
+		if (alarm && k_uptime_get() - t0 >= ALARM_MIN_WINDOW_MS) {
+			LOG_INF("Shipment event — closing the window early");
 			break;
 		}
 		IF_ENABLED(CONFIG_FOTA_DOWNLOAD,
@@ -455,35 +594,20 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 			(float)sqrt(m_m2 / (n_acc - 1)) * G_TO_MS2 : 0.0f;
 	}
 
-	struct motion_out mo;
+	struct shp_trip trip;
 
-	motion_window(&mo);
-	rec->mot_ok = mo.valid;
-	if (mo.valid) {
-		for (int i = 0; i < MC_COUNT; i++) {
-			rec->sec[i] = mo.sec[i];
-		}
-		rec->sec_lat = mo.sec_lat;
-		rec->steps = mo.steps;
-		rec->pos_chg = mo.pos_chg;
-		rec->still_max = mo.still_max;
-		rec->acc_peak = mo.acc_peak;
-		rec->pitch = mo.pitch;
-		rec->roll = mo.roll;
-		rec->pitch_sd = mo.pitch_sd;
-		rec->gait_n = mo.gait_n;
-		rec->gait_f = mo.gait_f;
-		rec->gait_reg = mo.gait_reg;
-		rec->gait_asym = mo.gait_asym;
-		rec->gait_bob = mo.gait_bob;
-	}
+	SHP_LOCK();
+	shipment_window(&rec->shp);
+	shipment_trip_get(&trip);
+	SHP_UNLOCK();
+	rec->trip = trip.active;
+	rec->trip_s = trip.dur_s;
+	rec->trip_ok = shipment_trip_ok(&trip);
+	trip_persist(false);
 
-	rec->t_skin = nt[PT_SKIN] ? (float)(st[PT_SKIN] / nt[PT_SKIN]) : NAN;
-	rec->t_skin_min = sk_min;
-	rec->t_skin_max = sk_max;
-	rec->t_skin_sd = nt[PT_SKIN] > 1 ? (float)sqrt(sk_m2 / (nt[PT_SKIN] - 1)) : NAN;
+	rec->t_in = nt[PT_PROD] ? (float)(st[PT_PROD] / nt[PT_PROD]) : NAN;
 	rec->t_amb = nt[PT_AMB] ? (float)(st[PT_AMB] / nt[PT_AMB]) : NAN;
-	rec->t_sun = nt[PT_SUN] ? (float)(st[PT_SUN] / nt[PT_SUN]) : NAN;
+	rec->t_aux = nt[PT_SUN] ? (float)(st[PT_SUN] / nt[PT_SUN]) : NAN;
 
 	(void)pmic_update(&rec->pm);
 	rec->t_bat = rec->pm.present ? rec->pm.t_bat : NAN;
@@ -492,18 +616,21 @@ static void telemetry_window(const struct app_cfg *cfg, struct tel_rec *rec)
 	(void)bringup_cell_monitor(&rec->cell);
 	rec->leds = leds_report();
 
-	LOG_INF("Record seq=%u: acc %.2f/%.2f/%.2f act %.3f (n=%u) | T skin/amb/sun "
-		"%.2f/%.2f/%.2f | vbat %.3f soc %.0f chg %d t_bat %.1f | rsrp %d",
+	const struct shp_win *w = &rec->shp;
+
+	LOG_INF("Record seq=%u: acc %.2f/%.2f/%.2f act %.3f (n=%u) | T in/amb/aux "
+		"%.2f/%.2f/%.2f | vbat %.3f soc %.0f chg %d | rsrp %d",
 		rec->seq, (double)rec->acc_x, (double)rec->acc_y, (double)rec->acc_z,
-		(double)rec->act, n_acc, (double)rec->t_skin, (double)rec->t_amb,
-		(double)rec->t_sun, (double)rec->pm.vbat, (double)rec->pm.soc,
-		rec->pm.chg, (double)rec->t_bat, rec->cell.valid ? rec->cell.rsrp : 0);
-	if (mo.valid) {
-		LOG_INF("Motion: graze %u rum %u walk %u run %u rest %u other %u s | lat %u "
-			"steps %u pos %u | pitch %.1f roll %.1f | gait n %u asym %.2f",
-			mo.sec[MC_GRAZE], mo.sec[MC_RUM], mo.sec[MC_WALK], mo.sec[MC_RUN],
-			mo.sec[MC_REST], mo.sec[MC_OTHER], mo.sec_lat, mo.steps, mo.pos_chg,
-			(double)mo.pitch, (double)mo.roll, mo.gait_n, (double)mo.gait_asym);
+		(double)rec->act, n_acc, (double)rec->t_in, (double)rec->t_amb,
+		(double)rec->t_aux, (double)rec->pm.vbat, (double)rec->pm.soc,
+		rec->pm.chg, rec->cell.valid ? rec->cell.rsrp : 0);
+	if (w->valid) {
+		LOG_INF("Shipment: shock %u (max %.1f g) fall %u (max %u ms) tilt %.0f deg "
+			"orient %u | T %.1f..%.1f out %u s | events %u (+%u lost) | trip %s %u s %s",
+			w->shocks, (double)w->shock_max, w->falls, w->fall_max_ms,
+			(double)w->tilt, w->orient, (double)w->t_min, (double)w->t_max,
+			w->t_out_s, w->n_evt, w->evt_lost, rec->trip ? "on" : "off",
+			rec->trip_s, rec->trip_ok ? "ok" : "VIOLATED");
 	}
 }
 
@@ -583,7 +710,7 @@ static int ensure_connected(void)
  */
 static int flush_backlog(void)
 {
-	static char json[1536];
+	static char json[2048];
 	int sent = 0;
 
 	while (telemetry_pending() > 0 && sent < BACKLOG_PER_CYCLE) {
@@ -609,51 +736,22 @@ static int flush_backlog(void)
 	return sent;
 }
 
-/* Send a finished raw burst, one block (2 s, 100 samples) per message:
- * {"b":<start unix s>,"k":<block>,"n":<blocks>,"hz":50,"d":[x,y,z,...]} in mg.
- * Blocks already acked are skipped, so a dropped link resumes next cycle.
+/* Trip report (after start/stop/report) on versor/evt/<id>, retried until
+ * it is acked.
  */
-static void send_raw(void)
+static void send_trip_report(void)
 {
-	static char buf[2048];
+	static char buf[512];
 
-	if (!motion_raw_ready()) {
+	if (!atomic_get(&trip_report)) {
 		return;
 	}
-	int n = motion_raw_blocks();
-
-#if defined(CONFIG_DATE_TIME)
-	/* No network time when recording started: estimate it now (the backend
-	 * rejects bursts without a time; a few seconds off is fine for tests).
-	 */
-	int64_t now;
-
-	if (motion_raw_start_ts() == 0 && date_time_now(&now) == 0) {
-		motion_raw_set_start(now / 1000 - (int64_t)n * MOTION_EPOCH_N / MOTION_HZ);
-	}
-#endif
-	if (motion_raw_start_ts() == 0) {
+	if (trip_format(buf, sizeof(buf)) < 0) {
 		return;
 	}
-	for (int k = 0; k < n; k++) {
-		int len;
-		const int16_t *d = motion_raw_block(k, &len);
-
-		if (!d || motion_raw_block_sent(k)) {
-			continue;
-		}
-		int w = snprintk(buf, sizeof(buf), "{\"b\":%lld,\"k\":%d,\"n\":%d,\"hz\":%d,\"d\":[",
-				 (long long)motion_raw_start_ts(), k, n, MOTION_HZ);
-
-		for (int i = 0; i < len * 3 && w < (int)sizeof(buf) - 8; i++) {
-			w += snprintk(buf + w, sizeof(buf) - w, i ? ",%d" : "%d", d[i]);
-		}
-		w += snprintk(buf + w, sizeof(buf) - w, "]}");
-		wdt_kick();
-		if (bringup_mqtt_session_publish_raw(buf) != 0) {
-			return;
-		}
-		motion_raw_sent(k);
+	wdt_kick();
+	if (bringup_mqtt_session_publish_raw(buf) == 0) {
+		atomic_set(&trip_report, 0);
 	}
 }
 
@@ -721,7 +819,8 @@ static void send_cycle(const struct app_cfg *cfg)
 
 	int sent = flush_backlog();
 
-	send_raw();
+	trip_requests();
+	send_trip_report();
 	fota_housekeeping(sent > 0);
 
 	if (cfg->mode == APP_MODE_NORMAL) {
@@ -748,7 +847,7 @@ int main(void)
 	k_sleep(K_SECONDS(1));
 
 	LOG_INF("========================================");
-	LOG_INF(" CDC-INCO-Prototyp-R1A  test firmware %s", APP_FW_VERSION);
+	LOG_INF(" Versor shipment logger %s (Pecura R1A hardware)", APP_FW_VERSION);
 	LOG_INF(" board=%s  built %s %s", CONFIG_BOARD, __DATE__, __TIME__);
 	LOG_INF(" I2C P0.30/31 | BMI323@0x68 | nPM1300@0x6B | Pt1000 AIN0-3/P0.07");
 	LOG_INF("========================================");
@@ -767,7 +866,14 @@ int main(void)
 		LOG_WRN("BMI323 init failed — accel will read 0 (check I2C / VDD_1V8)");
 	}
 	(void)pmic_init();
-	motion_init();
+	shipment_init();
+	/* devcfg_init() ran settings_subsys_init(); load our own subtree. */
+	(void)settings_load_subtree("vsr");
+	if (trip_loaded && trip_stored.magic == SHP_TRIP_MAGIC && trip_stored.active) {
+		shipment_trip_restore(&trip_stored);
+		trip_persist(true);
+		LOG_INF("Trip restored after reset (%u s so far)", trip_stored.dur_s);
+	}
 
 	/* FOTA: register the download handler and log the MCUboot swap/confirm
 	 * state. A freshly swapped-in image starts unconfirmed; the loop confirms
@@ -1027,6 +1133,33 @@ static int cmd_ship(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "Ship mode: device switches OFF, wake it by putting it on the Qi pad.");
 	return pmic_ship_mode();
 }
+static int cmd_trip(const struct shell *sh, size_t argc, char **argv)
+{
+	static char buf[512];
+
+	if (argc > 1 && !strcmp(argv[1], "start")) {
+		app_trip_cmd(1);
+		shell_print(sh, "Trip start queued (main loop, within 0.1 s). "
+			    "Reference = the next still orientation.");
+		return 0;
+	}
+	if (argc > 1 && !strcmp(argv[1], "stop")) {
+		app_trip_cmd(0);
+		shell_print(sh, "Trip stop queued.");
+		return 0;
+	}
+	(void)trip_format(buf, sizeof(buf));
+	shell_print(sh, "%s", buf);
+
+	struct shp_params p;
+
+	SHP_LOCK();
+	shipment_get_params(&p);
+	SHP_UNLOCK();
+	shell_print(sh, "cfg: shock_mg %d fall_ms %d tilt %d t_lim %d t_lo %d t_hi %d alarm %d",
+		    p.shock_mg, p.fall_ms, p.tilt_deg, p.t_lim, p.t_lo, p.t_hi, p.alarm);
+	return 0;
+}
 static int cmd_reboot(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(sh); ARG_UNUSED(argc); ARG_UNUSED(argv);
@@ -1058,7 +1191,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(bu_sub,
 	SHELL_CMD(id,       NULL, "id [P0.1.x] : show / set device id (reboots)", cmd_id),
 	SHELL_CMD(status,   NULL, "Config, battery, cell, GNSS quality", cmd_status),
 	SHELL_CMD(ship,     NULL, "PMIC ship mode (off until Qi/VBUS)", cmd_ship),
+	SHELL_CMD(trip,     NULL, "trip [start|stop] : shipment trip / show", cmd_trip),
 	SHELL_CMD(reboot,   NULL, "Reboot",                            cmd_reboot),
 	SHELL_SUBCMD_SET_END
 );
-SHELL_CMD_REGISTER(bu, &bu_sub, "CDC-INCO-Prototyp-R1A test firmware", NULL);
+SHELL_CMD_REGISTER(bu, &bu_sub, "Versor shipment logger (Pecura R1A)", NULL);
