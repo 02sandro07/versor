@@ -1,0 +1,11 @@
+# Build output
+build/
+build_*/
+twister-out*/
+
+# West / NCS workspace artifacts
+*.hex
+*.bin
+
+# Local secret (HiveMQ password) — keep the .example template only
+src/app_credentials.h

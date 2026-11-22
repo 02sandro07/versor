@@ -1,0 +1,205 @@
+/*
+ * CDC-INCO-Prototyp-R1A (CU board) pin map, applied on top of the nRF9151-DK
+ * build. We build for the DK target because the SiP (flash/RAM/partitions) is
+ * identical; this overlay re-describes the peripherals to match the CU board so
+ * the DK on-board J-Link can flash the external CU board via DEBUG OUT -> J600.
+ *
+ * Pin map is taken from the FINAL ordered schematic (shematic-R1A-ordered.pdf,
+ * Controller/Sensors sheets) and the ODB++ netlist (Testplan v2.0).
+ *
+ *   I2C (TWIM2)  SDA = P0.30, SCL = P0.31   (nPM1300 @0x6B + BMI323 @0x68)
+ *   IMU BMI323   INT1 = P0.05, INT2 = P0.06
+ *   Pt1000 temps excitation drive = P0.07 (V_TEMP rail high = 1.8 V)
+ *                V_TEMP sense = AIN3/P0.16, T1..T3 = AIN0..AIN2 / P0.13..P0.15
+ */
+
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/i2c/i2c.h>
+#include <dt-bindings/regulator/npm13xx.h>
+
+/ {
+	/* Handles the bring-up firmware pulls out of the devicetree. */
+	zephyr,user {
+		/* 4 SAADC channels: idx0=T1, idx1=T2, idx2=T3, idx3=V_TEMP top */
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>;
+		/* GPIO that drives the top of the Pt1000 dividers high during a read */
+		temp-exc-gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+		/* BMI323 interrupt lines (input, pulled low so an idle line reads 0) */
+		imu-int1-gpios = <&gpio0 5 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		imu-int2-gpios = <&gpio0 6 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+	};
+};
+
+&pinctrl {
+	i2c2_default_alt: i2c2_default_alt {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 30)>,
+				<NRF_PSEL(TWIM_SCL, 0, 31)>;
+		};
+	};
+
+	i2c2_sleep_alt: i2c2_sleep_alt {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 30)>,
+				<NRF_PSEL(TWIM_SCL, 0, 31)>;
+			low-power-enable;
+		};
+	};
+};
+
+/* Re-point TWIM2 to the CU-board I2C pins. */
+&i2c2 {
+	status = "okay";
+	compatible = "nordic,nrf-twim";
+	pinctrl-0 = <&i2c2_default_alt>;
+	pinctrl-1 = <&i2c2_sleep_alt>;
+	pinctrl-names = "default", "sleep";
+	/* 100 kHz for bring-up robustness; bump to _FAST (400k) once verified. */
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	zephyr,concat-buf-size = <256>;
+
+	/* nPM1300 on the Power board (U500), same bus as the BMI323. Wiring from
+	 * shematic-R1A-ordered.pdf, Power sheet:
+	 *   BUCK1 = VDD_1V8 (VSET1 47k -> 1.8 V, set by resistor, "always 1V8")
+	 *   BUCK2 = VDD_3V0 (VSET2 150k -> 3.0 V, set by resistor)
+	 *   LDO1  = VDD_GNSS: LSIN1 <- VDD_3V0, VOUTLDO1 -> R507 0R -> VDD_GNSS
+	 *           (R506/R508 not fitted) -> must be switched on as a 1.8 V LDO
+	 *   LDO2  = unused (LSIN2/VOUTLDO2 tied to GND) -> never touch
+	 *   LED0 = LED501 red, LED1 = LED500 green, LED2 = D500 blue (all to VSYS,
+	 *          5 mA internal sink)
+	 *   NTC  = battery connector P500 pin 2 (P500: 1 = +, 2 = NTC, 3 = -)
+	 *   GPIO0-4 -> nRF P0.00-P0.04 (not used yet), SHPHLD unconnected
+	 * If the Power board is not attached the MFD init fails and all children
+	 * stay "not ready" — the firmware checks device_is_ready() and runs on.
+	 */
+	npm1300_pmic: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+
+		npm1300_regulators: regulators {
+			compatible = "nordic,npm1300-regulator";
+
+			/* BUCK1/BUCK2 voltages come from the VSET resistors. Deliberately
+			 * NO regulator-init-microvolt here: software must never be able
+			 * to move VDD_1V8 (VDD_GPIO, sensors, SWD VTref) or VDD_3V0.
+			 */
+			npm1300_buck1: BUCK1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-always-on;
+			};
+
+			npm1300_buck2: BUCK2 {
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+				regulator-always-on;
+			};
+
+			/* VDD_GNSS (external LNA SKY65943) = 1.8 V LDO from VDD_3V0. */
+			npm1300_ldo1: LDO1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-init-microvolt = <1800000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+			};
+		};
+
+		/* Battery: XINJ PL405070, 3.7 V 3000 mAh LiPo, 3-wire with NTC.
+		 * Datasheet (eBay listing): standard charge 0.5 C CC to 4.2 V, CV until
+		 * 0.05 C; built-in protection PCB. The nPM1300 caps charge current at
+		 * 800 mA (~0.27 C), well inside the cell rating.
+		 *
+		 * Charge temperature window (JOB 2026-09-29), enforced in HARDWARE by the
+		 * nPM1300 JEITA logic via the battery NTC:
+		 *   < 0 C        cold  -> no charging
+		 *   0 .. 10 C    cool  -> charge current halved by hardware (400 mA)
+		 *   10 .. 35 C   normal-> full 800 mA
+		 *   35 .. 45 C   warm  -> termination 4.10 V (hardware); the firmware
+		 *                         additionally halves the current (pmic.c)
+		 *   > 45 C       hot   -> no charging
+		 *
+		 * NTC type is NOT given by the seller. 10 k / B 3435 is the usual part in
+		 * these cells — CHECK with a multimeter between the white wire and minus:
+		 * ~10 kOhm at 25 C. If it reads ~47 k or ~100 k, change thermistor-ohms.
+		 */
+		npm1300_charger: charger {
+			compatible = "nordic,npm1300-charger";
+			term-microvolt = <4200000>;
+			term-warm-microvolt = <4100000>;
+			current-microamp = <800000>;
+			dischg-limit-microamp = <1000000>;
+			/* BQ51013B Qi receiver delivers ~5 V / 1 A into VBUS. */
+			vbus-limit-microamp = <1000000>;
+			thermistor-ohms = <10000>;
+			thermistor-beta = <3435>;
+			thermistor-cold-millidegrees = <0>;
+			thermistor-cool-millidegrees = <10000>;
+			thermistor-warm-millidegrees = <35000>;
+			thermistor-hot-millidegrees = <45000>;
+			charging-enable;
+		};
+
+		/* All three LEDs under firmware control (modes, drain, charge hint). */
+		npm1300_leds: leds {
+			compatible = "nordic,npm1300-led";
+			nordic,led0-mode = "host";
+			nordic,led1-mode = "host";
+			nordic,led2-mode = "host";
+		};
+	};
+};
+
+/* SAADC: internal 0.6 V reference, 12-bit, 40 us acquisition (500 ohm source +
+ * 100 nF settle comfortably). GAIN differs by channel on purpose:
+ *   - Pt1000 nodes AIN0..AIN2 sit at ~0.9-1.1 V over the whole plausible temp
+ *     range, so gain 1/2 (full-scale 1.2 V) is used -> the ADC code is worth
+ *     ~0.18 C instead of ~0.37 C, doubling temperature resolution. Even +180 C
+ *     stays under 1.2 V, so there is no clipping headroom concern.
+ *   - AIN3 senses the ~1.8 V V_TEMP excitation top, which does NOT fit in 1.2 V,
+ *     so it keeps gain 1/4 (full-scale 2.4 V). The ratiometric math uses mV from
+ *     each channel's own gain, so mixing gains is correct.
+ */
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_2";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN0>; /* P0.13 = T1 (COW) */
+		zephyr,resolution = <12>;
+	};
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_2";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN1>; /* P0.14 = T2 (AMBIENT) */
+		zephyr,resolution = <12>;
+	};
+
+	channel@2 {
+		reg = <2>;
+		zephyr,gain = "ADC_GAIN_1_2";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN2>; /* P0.15 = T3 (AMBIENT_SUN) */
+		zephyr,resolution = <12>;
+	};
+
+	channel@3 {
+		reg = <3>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN3>; /* P0.16 = V_TEMP excitation sense */
+		zephyr,resolution = <12>;
+	};
+};
